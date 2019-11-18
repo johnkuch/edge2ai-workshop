@@ -392,7 +392,7 @@ OPTIONAL    }
           "configs": [
             {
               "name": "yarn_nodemanager_resource_memory_mb",
-              "value": "6144"
+              "value": "12288"
             }
           ],
           "refName": "yarn-NODEMANAGER-BASE",
@@ -464,10 +464,6 @@ OPTIONAL    }
         }
       ],
       "serviceConfigs": [
-        {
-          "name": "nifitoolkitca_service",
-          "ref": "nifitoolkitca"
-        }
       ],
       "serviceType": "NIFIREGISTRY"
     },
@@ -499,14 +495,6 @@ OPTIONAL    }
         }
       ],
       "serviceConfigs": [
-        {
-          "name": "zookeeper_service",
-          "ref": "zookeeper"
-        },
-        {
-          "name": "nifitoolkitca_service",
-          "ref": "nifitoolkitca"
-        }
       ],
       "serviceType": "NIFI"
     },
@@ -537,22 +525,6 @@ OPTIONAL    }
       ],
       "serviceConfigs": [
         {
-          "name": "yarn_service",
-          "ref": "yarn"
-        },
-        {
-          "name": "hdfs_service",
-          "ref": "hdfs"
-        },
-        {
-          "name": "hive_service",
-          "ref": "hive"
-        },
-        {
-          "name": "spark_on_yarn_service",
-          "ref": "spark_on_yarn"
-        },
-        {
           "name": "cdsw.domain.config",
           "value": "YourCDSWDomain"
         },
@@ -567,18 +539,6 @@ OPTIONAL    }
       "refName": "flink",
       "serviceType": "FLINK",
       "serviceConfigs": [
-        {
-          "name": "yarn_service",
-          "ref": "yarn"
-        },
-        {
-          "name": "zookeeper_service",
-          "ref": "zookeeper"
-        },
-        {
-          "name": "hdfs_service",
-          "ref": "hdfs"
-        }
       ],
       "roleConfigGroups": [
         {
@@ -609,10 +569,6 @@ OPTIONAL          "roleType": "SCHEMA_REGISTRY_SERVER"
 OPTIONAL        }
 OPTIONAL      ],
 OPTIONAL      "serviceConfigs": [
-OPTIONAL        {
-OPTIONAL          "name": "zookeeper_service",
-OPTIONAL          "ref": "zookeeper"
-OPTIONAL        }
 OPTIONAL      ],
 OPTIONAL      "serviceType": "SCHEMAREGISTRY"
 OPTIONAL    },
@@ -662,12 +618,6 @@ OPTIONAL          "value" : "admin"
 OPTIONAL        }, {
 OPTIONAL          "name" : "cm.metrics.service.name",
 OPTIONAL          "value" : "kafka"
-OPTIONAL        }, {
-OPTIONAL          "name": "zookeeper_service",
-OPTIONAL          "ref": "zookeeper"
-OPTIONAL        }, {
-OPTIONAL          "name": "kafka_service",
-OPTIONAL          "ref": "kafka"
 OPTIONAL        }
 OPTIONAL      ],
 OPTIONAL      "serviceType": "STREAMS_MESSAGING_MANAGER"

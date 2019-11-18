@@ -288,6 +288,43 @@ python $BASE_DIR/create_cluster.py $(hostname -f) $TEMPLATE $KEY_FILE $CM_REPO_U
 
 # Flink: extra workaround due to https://jira.cloudera.com/browse/CSA-116
 sudo -u hdfs hdfs dfs -chown flink:flink /user/flink
+sudo -u hdfs hdfs dfs -mkdir /user/centos
+sudo -u hdfs hdfs dfs -chown centos:centos /user/centos
+# Runs a quick WordCount to ensure everything is ok
+echo "foo bar" > echo.txt
+export HADOOP_USER_NAME=flink
+hdfs dfs -put echo.txt
+flink run -sae -m yarn-cluster -p 2 /opt/cloudera/parcels/FLINK/lib/flink/examples/streaming/WordCount.jar --input hdfs:///user/$HADOOP_USER_NAME/echo.txt --output hdfs:///user/$HADOOP_USER_NAME/output 
+hdfs dfs -cat hdfs:///user/$HADOOP_USER_NAME/output/*
+unset HADOOP_USER_NAME
+
+# Install Maven
+curl http://mirrors.sonic.net/apache/maven/maven-3/3.6.2/binaries/apache-maven-3.6.2-bin.tar.gz > /tmp/apache-maven-3.6.2-bin.tar.gz
+tar -C ~centos -zxvf /tmp/apache-maven-3.6.2-bin.tar.gz
+rm -f /tmp/apache-maven-3.6.2-bin.tar.gz
+echo "export PATH=\$PATH:$(echo ~centos)/apache-maven-3.6.2/bin" >> ~centos/.bash_profile
+
+# Install jars needed for the workshop
+for file in /tmp/resources/flink-jars/*; do
+  file_name=$(basename $file)
+  version=$(echo "$file_name" | sed 's/.*-\([0-9].*\)\.\(jar\|pom\)/\1/')
+  artifact=${file_name%-${version}*}
+  packaging=${file_name##*.}
+  if [ "$artifact" == "frocksdbjni" ]; then
+    group_id=com.data-artisans
+  else
+    group_id=org.apache.flink
+  fi
+  sudo -u centos ~centos/apache-maven-3.6.2/bin/mvn install:install-file \
+    -Dfile=$file \
+    -DgroupId=$group_id \
+    -DartifactId=$artifact \
+    -Dversion=$version \
+    -Dpackaging=$packaging
+done
+
+# Clone repo
+sudo -u centos git clone https://github.com/asdaraujo/flink-tutorials.git ~centos/flink-tutorials
 
 echo "-- Create Kafka topic (iot)"
 kafka-topics --zookeeper edge2ai-1.dim.local:2181 --create --topic iot --partitions 10 --replication-factor 1
