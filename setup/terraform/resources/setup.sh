@@ -11,53 +11,18 @@ if [ "$USER" != "root" ]; then
 fi
 
 CLOUD_PROVIDER=${1:-aws}
-TEMPLATE=${2:-}
-DOCKERDEVICE=${3:-}
-NOPROMPT=${4:-}
-SSH_USER=${5:-}
-SSH_PWD=${6:-}
-NAMESPACE=${7:-}
+SSH_USER=${2:-}
+SSH_PWD=${3:-}
+NAMESPACE=${4:-}
+DOCKER_DEVICE=${5:-}
+
 export NAMESPACE
 
-BASE_DIR=$(cd $(dirname $0); pwd -P)
+BASE_DIR=$(cd $(dirname $0); pwd -L)
+source $BASE_DIR/common.sh
 KEY_FILE=${BASE_DIR}/myRSAkey
 
-if [ -e $BASE_DIR/stack.$NAMESPACE.sh ]; then
-  source $BASE_DIR/stack.${NAMESPACE}.sh
-else
-  source $BASE_DIR/stack.sh
-fi
-
-TEMPLATE=${TEMPLATE}.${CDH_MAJOR_VERSION}
-
-# Often yum connection to Cloudera repo fails and causes the instance create to fail.
-# yum timeout and retries options don't see to help in this type of failure.
-# We explicitly retry a few times to make sure the build continues when these timeouts happen.
-function yum_install() {
-  local packages=$@
-  local retries=10
-  while true; do
-    set +e
-    yum install -d1 -y ${packages}
-    RET=$?
-    set -e
-    if [[ ${RET} == 0 ]]; then
-      break
-    fi
-    retries=$((retries - 1))
-    if [[ ${retries} -lt 0 ]]; then
-      echo 'YUM install failed!'
-      exit 1
-    else
-      echo 'Retrying YUM...'
-    fi
-  done
-}
-
-function get_homedir() {
-  local username=$1
-  getent passwd $username | cut -d: -f6
-}
+load_stack $NAMESPACE
 
 #########  Start Packer Installation
 
@@ -73,32 +38,30 @@ if [[ ! -f $CM_REPO_FILE ]]; then
   wget --progress=dot:giga ${CM_REPO_FILE_URL} -O $CM_REPO_FILE
   sed -i -E "s#https?://[^/]*#${CM_BASE_URL}#g" $CM_REPO_FILE
 
-  echo "-- Install MariaDB yum repo"
-  cat - >/etc/yum.repos.d/MariaDB.repo <<EOF
-  [mariadb]
-name = MariaDB
-baseurl = http://yum.mariadb.org/10.1/centos7-amd64
-gpgkey=https://yum.mariadb.org/RPM-GPG-KEY-MariaDB
-gpgcheck=1
-EOF
+  echo "-- Install PostgreSQL yum repo"
+  rpm -Uvh https://yum.postgresql.org/10/redhat/rhel-7-x86_64/pgdg-centos10-10-2.noarch.rpm
 
   echo "-- Running remaining binary preinstalls"
   yum clean all
   rm -rf /var/cache/yum/
   yum repolist
 
-  yum_install cloudera-manager-daemons cloudera-manager-agent cloudera-manager-server \
-              MariaDB-server MariaDB-client shellinabox mosquitto jq transmission-cli
+  yum_install cloudera-manager-daemons cloudera-manager-agent cloudera-manager-server rng-tools \
+              postgresql10-server postgresql10 postgresql-jdbc shellinabox mosquitto jq transmission-cli
   npm install --quiet forever -g
+  yum erase -y python-requests
   pip install --quiet --upgrade pip
-  pip install --progress-bar off cm_client paho-mqtt
-  systemctl disable mariadb
+  pip install --progress-bar off cm_client paho-mqtt pytest nipyapi
+  pip install --progress-bar off psycopg2==2.7.5 --ignore-installed
+  systemctl disable postgresql-10
 
   echo "-- Install Maven"
-  curl http://mirrors.sonic.net/apache/maven/maven-3/3.6.2/binaries/apache-maven-3.6.2-bin.tar.gz > /tmp/apache-maven-3.6.2-bin.tar.gz
-  tar -C $(get_homedir $SSH_USER) -zxvf /tmp/apache-maven-3.6.2-bin.tar.gz
-  rm -f /tmp/apache-maven-3.6.2-bin.tar.gz
-  echo "export PATH=\$PATH:$(get_homedir $SSH_USER)/apache-maven-3.6.2/bin" >> $(get_homedir $SSH_USER)/.bash_profile
+  curl "$MAVEN_BINARY_URL" > /tmp/apache-maven-bin.tar.gz
+
+  tar -C $(get_homedir $SSH_USER) -zxvf /tmp/apache-maven-bin.tar.gz
+  rm -f /tmp/apache-maven-bin.tar.gz
+  MAVEN_BIN=$(ls -d1tr $(get_homedir $SSH_USER)/apache-maven-*/bin | tail -1)
+  echo "export PATH=\$PATH:$MAVEN_BIN" >> $(get_homedir $SSH_USER)/.bash_profile
 
   echo "-- Get and extract CEM tarball to /opt/cloudera/cem"
   mkdir -p /opt/cloudera/cem
@@ -138,7 +101,7 @@ EOF
   systemctl disable minifi
 
   echo "-- Download and install MQTT Processor NAR file"
-  wget http://central.maven.org/maven2/org/apache/nifi/nifi-mqtt-nar/1.8.0/nifi-mqtt-nar-1.8.0.nar -P /opt/cloudera/cem/minifi/lib
+  wget https://repo1.maven.org/maven2/org/apache/nifi/nifi-mqtt-nar/1.8.0/nifi-mqtt-nar-1.8.0.nar -P /opt/cloudera/cem/minifi/lib
   chown root:root /opt/cloudera/cem/minifi/lib/nifi-mqtt-nar-1.8.0.nar
   chmod 660 /opt/cloudera/cem/minifi/lib/nifi-mqtt-nar-1.8.0.nar
 
@@ -202,17 +165,20 @@ EOF
   fi
 
   echo "-- Install JDBC connector"
-  wget --progress=dot:giga ${JDBC_CONNECTOR_URL} -P ${BASE_DIR}/
-  TAR_FILE=$(basename ${JDBC_CONNECTOR_URL})
-  BASE_NAME=${TAR_FILE%.tar.gz}
-  tar zxf ${BASE_DIR}/${TAR_FILE} -C ${BASE_DIR}/
-  mkdir -p /usr/share/java/
-  cp ${BASE_DIR}/${BASE_NAME}/${BASE_NAME}-bin.jar /usr/share/java/mysql-connector-java.jar
+  cp /usr/share/java/postgresql-jdbc.jar /usr/share/java/postgresql-connector-java.jar
+  chmod 644 /usr/share/java/postgresql-connector-java.jar
 
   echo "-- Install CSDs"
   for url in "${CSD_URLS[@]}"; do
     echo "---- Downloading $url"
     wget --progress=dot:giga ${url} -P /opt/cloudera/csd/
+    # Patch CDSW CSD so that we can use it on CDP
+    if [ "$url" == "$CDSW_CSD_URL" -a "$CM_MAJOR_VERSION" == "7" ]; then
+      jar xvf /opt/cloudera/csd/CLOUDERA_DATA_SCIENCE_WORKBENCH-*.jar descriptor/service.sdl
+      sed -i 's/"max" *: *"6"/"max" : "7"/g' descriptor/service.sdl
+      jar uvf /opt/cloudera/csd/CLOUDERA_DATA_SCIENCE_WORKBENCH-*.jar descriptor/service.sdl
+      rm -rf descriptor
+    fi
   done
 
   echo "-- Enable password authentication"
@@ -239,7 +205,11 @@ fi
 
 ##### Start install
 
-# Prewarm parcel directory
+echo "--Ensure there's plenty of entropy"
+systemctl enable rngd
+systemctl start rngd
+
+echo "-- Prewarm parcel directory"
 for parcel_file in $(find /opt/cloudera/parcel-repo -type f); do
   dd if=$parcel_file of=/dev/null bs=10M &
 done
@@ -298,17 +268,17 @@ cat key.pem cert.pem > /var/lib/shellinabox/certificate.pem
 systemctl enable shellinaboxd
 systemctl start shellinaboxd
 
-if [[ -n "${CDSW_VERSION}" ]]; then
-    echo "CDSW_VERSION is set to '${CDSW_VERSION}'"
+if [[ -n "${CDSW_BUILD}" ]]; then
+    echo "CDSW_BUILD is set to '${CDSW_BUILD}'"
     # CDSW requires Centos 7.5, so we trick it to believe it is...
     echo "CentOS Linux release 7.5.1810 (Core)" > /etc/redhat-release
     # If user doesn't specify a device, tries to detect a free one to use
     # Device must be unmounted and have at least 200G of space
-    if [[ "${DOCKERDEVICE}" == "" ]]; then
+    if [[ "${DOCKER_DEVICE}" == "" ]]; then
       echo "Docker device was not specified in the command line. Will try to detect a free device to use"
       TMP_FILE=${BASE_DIR}/.device.list
       # Find devices that are not mounted and have size greater than or equal to 200G
-      lsblk -o NAME,MOUNTPOINT,SIZE -s -p -n | awk '/^\// && NF == 2 && $TEMPLATE ~ /([2-9]|[0-9][0-9])[0-9][0-9]G/' > "${TMP_FILE}"
+      lsblk -o NAME,MOUNTPOINT,SIZE -s -p -n | awk '/^\// && NF == 2 && $NF ~ /([2-9]|[0-9][0-9])[0-9][0-9]G/' > "${TMP_FILE}"
       if [[ $(cat $TMP_FILE | wc -l) == 0 ]]; then
         echo "ERROR: Could not find any candidate devices."
         exit 1
@@ -317,29 +287,43 @@ if [[ -n "${CDSW_VERSION}" ]]; then
         cat ${TMP_FILE}
         exit 1
       else
-        DOCKERDEVICE=$(awk '{print $1}' ${TMP_FILE})
+        DOCKER_DEVICE=$(awk '{print $1}' ${TMP_FILE})
       fi
       rm -f ${TMP_FILE}
     fi
-    echo "Docker device: ${DOCKERDEVICE}"
+    echo "Docker device: ${DOCKER_DEVICE}"
 else
-    echo "CDSW_VERSION is unset, skipping CDSW installation";
+    echo "CDSW_BUILD is unset, skipping CDSW installation";
 fi
 
-echo "--Configure and start MariaDB"
-echo "-- Configure MariaDB"
-cat ${BASE_DIR}/mariadb.config > /etc/my.cnf
-systemctl enable mariadb
-systemctl start mariadb
+echo "-- Configure PostgreSQL"
+echo 'LC_ALL="en_US.UTF-8"' >> /etc/locale.conf
+/usr/pgsql-10/bin/postgresql-10-setup initdb
+sed -i '/host *all *all *127.0.0.1\/32 *ident/ d' /var/lib/pgsql/10/data/pg_hba.conf
+cat >> /var/lib/pgsql/10/data/pg_hba.conf <<EOF
+host all all 127.0.0.1/32 md5
+host all all $(hostname -I | sed 's/ //g')/32 md5
+host all all 127.0.0.1/32 ident
+host ranger rangeradmin 0.0.0.0/0 md5
+EOF
+sed -i '/^[ #]*\(listen_addresses\|max_connections\|shared_buffers\|wal_buffers\|checkpoint_segments\|checkpoint_completion_target\) *=.*/ d' /var/lib/pgsql/10/data/postgresql.conf
+cat >> /var/lib/pgsql/10/data/postgresql.conf <<EOF
+listen_addresses = '*'
+max_connections = 2000
+shared_buffers = 256MB
+wal_buffers = 8MB
+checkpoint_completion_target = 0.9
+EOF
+
+echo "-- Start PostgreSQL"
+systemctl enable postgresql-10
+systemctl start postgresql-10
 
 echo "-- Create DBs required by CM"
-mysql -u root < ${BASE_DIR}/create_db.sql
-
-echo "-- Secure MariaDB"
-mysql -u root < ${BASE_DIR}/secure_mariadb.sql
+sudo -u postgres psql < ${BASE_DIR}/create_db_pg.sql
 
 echo "-- Prepare CM database 'scm'"
-/opt/cloudera/cm/schema/scm_prepare_database.sh mysql scm scm cloudera
+/opt/cloudera/cm/schema/scm_prepare_database.sh postgresql scm scm supersecret1
 
 echo "-- Install additional CSDs"
 for csd in $(find $BASE_DIR/csds -name "*.jar"); do
@@ -374,57 +358,12 @@ ssh-keyscan -H $(hostname) >> ~/.ssh/known_hosts
 sed -i 's/.*PermitRootLogin.*/PermitRootLogin without-password/' /etc/ssh/sshd_config
 systemctl restart sshd
 
-echo "-- Automate cluster creation using the CM API"
-sed -i "\
-s/YourHostname/$(hostname -f)/g;\
-s/YourCDSWDomain/cdsw.${PUBLIC_IP}.nip.io/g;\
-s/YourPrivateIP/$(hostname -I | tr -d '[:space:]')/g;\
-s/YourPublicDns/$PUBLIC_DNS/g;\
-s#YourDockerDevice#$DOCKERDEVICE#g;\
-s#ANACONDA_PARCEL_REPO#$ANACONDA_PARCEL_REPO#g;\
-s#ANACONDA_VERSION#$ANACONDA_VERSION#g;\
-s#CDH_PARCEL_REPO#$CDH_PARCEL_REPO#g;\
-s#CDH_BUILD#$CDH_BUILD#g;\
-s#CDH_VERSION#$CDH_VERSION#g;\
-s#CDSW_PARCEL_REPO#$CDSW_PARCEL_REPO#g;\
-s#CDSW_BUILD#$CDSW_BUILD#g;\
-s#CFM_PARCEL_REPO#$CFM_PARCEL_REPO#g;\
-s#CFM_VERSION#$CFM_VERSION#g;\
-s#CM_VERSION#$CM_VERSION#g;\
-s#SCHEMAREGISTRY_BUILD#$SCHEMAREGISTRY_BUILD#g;\
-s#STREAMS_MESSAGING_MANAGER_BUILD#$STREAMS_MESSAGING_MANAGER_BUILD#g;\
-s#CSA_PARCEL_REPO#$CSA_PARCEL_REPO#g;\
-s#FLINK_BUILD#$FLINK_BUILD#g;\
-" $TEMPLATE
-
 echo "-- Check for additional parcels"
 chmod +x ${BASE_DIR}/check-for-parcels.sh
-ALL_PARCELS=$(${BASE_DIR}/check-for-parcels.sh ${NOPROMPT})
 
-if [[ "$ALL_PARCELS" == "OK" ]]; then
-  sed -i "s/^CSPOPTION//" $TEMPLATE
-else
-  sed -i "/^CSPOPTION/ d" $TEMPLATE
-fi
-
-if [[ "$CSP_PARCEL_REPO" == "" ]]; then
-  sed -i "/CSPREPO/ d" $TEMPLATE
-else
-  sed -i "s#CSPREPO#,"\""$CSP_PARCEL_REPO"\""#" $TEMPLATE
-fi
-
-if [[ "$CDH_MAJOR_VERSION" == "7" ]]; then
-  sed -i "/^CDH7OPTION/ d" $TEMPLATE
-else
-  sed -i "s/^CDH7OPTION//" $TEMPLATE
-fi
-
-if [[ -n "$CDSW_BUILD" && "$CDH_MAJOR_VERSION" == "6" ]]; then # TODO: Change this when CDSW is available for CDP-DC
-  sed -i "s/^CDSWOPTION//" $TEMPLATE
-  sed -i "s#CDSWREPO#,"\""$CDSW_PARCEL_REPO"\""#" $TEMPLATE
-else
-  sed -i "/^CDSWOPTION/ d" $TEMPLATE
-  sed -i "/CDSWREPO/ d" $TEMPLATE
+if [ "$(is_kerberos_enabled)" == "yes" ]; then
+  echo "-- Install Kerberos KDC"
+  install_kerberos
 fi
 
 echo "-- Wait for CM to be ready before proceeding"
@@ -434,13 +373,27 @@ until $(curl --output /dev/null --silent --head --fail -u "admin:admin" http://l
 done
 echo "-- CM has finished starting"
 
+echo "-- Generate cluster template"
+TEMPLATE_FILE=$BASE_DIR/cluster_template.${NAMESPACE}.json
+export CDSW_DOMAIN=cdsw.${PUBLIC_IP}.nip.io
+export CLUSTER_HOST=$(hostname -f)
+export PRIVATE_IP=$(hostname -I | tr -d '[:space:]')
+export DOCKER_DEVICE PUBLIC_DNS
+python $BASE_DIR/cm_template.py --cdh-major-version $CDH_MAJOR_VERSION $CM_SERVICES > $TEMPLATE_FILE
+
+echo "-- Create cluster"
+if [ "$(is_kerberos_enabled)" == "yes" ]; then
+  KERBEROS_OPTION="--use-kerberos"
+else
+  KERBEROS_OPTION=""
+fi
 CM_REPO_URL=$(grep baseurl $CM_REPO_FILE | sed 's/.*=//;s/ //g')
-python $BASE_DIR/create_cluster.py $(hostname -f) $TEMPLATE $KEY_FILE $CM_REPO_URL
+python $BASE_DIR/create_cluster.py $KERBEROS_OPTION $(hostname -f) $TEMPLATE_FILE $KEY_FILE $CM_REPO_URL
 
 echo "-- Configure and start EFM"
 retries=0
 while true; do
-  mysql -u efm -pcloudera < <( echo -e "drop database efm;\ncreate database efm;" )
+  sudo -u postgres psql < <( echo -e "drop database efm;\nCREATE DATABASE efm OWNER efm ENCODING 'UTF8';" )
   nohup service efm start &
   sleep 10
   set +e
@@ -473,23 +426,34 @@ systemctl start minifi
 
 # TODO: Implement Ranger DB and Setup in template
 # TODO: Fix kafka topic creation once Ranger security is setup
-echo "-- Create Kafka topic (iot)"
-kafka-topics --zookeeper edge2ai-1.dim.local:2181/kafka --create --topic iot --partitions 10 --replication-factor 1
-kafka-topics --zookeeper edge2ai-1.dim.local:2181/kafka --describe --topic iot
+if [[ ",${CM_SERVICES}," == *",KAFKA,"* ]]; then
+  echo "-- Create Kafka topic (iot)"
+  auth kafka
+  if [ "$(is_kerberos_enabled)" == "yes" ]; then
+    CLIENT_CONFIG_OPTION="--command-config $KAFKA_CLIENT_PROPERTIES"
+  else
+    CLIENT_CONFIG_OPTION=""
+  fi
+  kafka-topics $CLIENT_CONFIG_OPTION --bootstrap-server $(hostname -f):9092 --create --topic iot --partitions 10 --replication-factor 1
+  kafka-topics $CLIENT_CONFIG_OPTION --bootstrap-server $(hostname -f):9092 --describe --topic iot
+  unauth
+fi
 
-if [[ -n "$FLINK_BUILD" && "$CDH_MAJOR_VERSION" == "6" ]]; then # TODO: Change this when Flink is available for CDP-DC
+if [[ ",${CM_SERVICES}," == *",FLINK,"* ]]; then
   echo "-- Flink: extra workaround due to CSA-116"
-  sudo -u hdfs hdfs dfs -chown flink:flink /user/flink
-  sudo -u hdfs hdfs dfs -mkdir /user/${SSH_USER}
-  sudo -u hdfs hdfs dfs -chown ${SSH_USER}:${SSH_USER} /user/${SSH_USER}
+  auth hdfs
+  hdfs dfs -chown flink:flink /user/flink
+  hdfs dfs -mkdir /user/${SSH_USER}
+  hdfs dfs -chown ${SSH_USER}:${SSH_USER} /user/${SSH_USER}
+  unauth
 
   echo "-- Runs a quick Flink WordCount to ensure everything is ok"
   echo "foo bar" > echo.txt
-  export HADOOP_USER_NAME=flink
+  auth flink
   hdfs dfs -put echo.txt
-  flink run -sae -m yarn-cluster -p 2 /opt/cloudera/parcels/FLINK/lib/flink/examples/streaming/WordCount.jar --input hdfs:///user/$HADOOP_USER_NAME/echo.txt --output hdfs:///user/$HADOOP_USER_NAME/output
-  hdfs dfs -cat hdfs:///user/$HADOOP_USER_NAME/output/*
-  unset HADOOP_USER_NAME
+  flink run -sae -m yarn-cluster -p 2 /opt/cloudera/parcels/FLINK/lib/flink/examples/streaming/WordCount.jar --input hdfs:///user/flink/echo.txt --output hdfs:///user/flink/output
+  hdfs dfs -cat hdfs:///user/flink/output/*
+  unauth
 fi
 
 echo "-- At this point you can login into Cloudera Manager host on port 7180 and follow the deployment of the cluster"

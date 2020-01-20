@@ -14,17 +14,46 @@ if [ $# != 1 ]; then
 fi
 NAMESPACE=$1
 load_env $NAMESPACE
+check_all_configs
+check_python_modules
 
-for sig in {0..31}; do
-  trap 'RET=$?; if [ $RET != 0 ]; then echo -e "\n   SETUP FAILED!!! (signal: '$sig', exit code: $RET)\n"; fi' $sig
-done
+# Check if enddate is close
+WARNING_THRESHOLD_DAYS=2
+DATE_CHECK=$(python -c "
+from datetime import datetime, timedelta
+dt = datetime.now()
+dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+print((datetime.strptime('$TF_VAR_enddate', '%m%d%Y') - dt).days)
+")
+
+if [ "$DATE_CHECK" -le "0" ]; then
+  echo 'ERROR: The expiration date for your environment is either set for today or already in the past.'
+  echo '       Please update "TF_VAR_endddate" in .env.'"$NAMESPACE"' and try again.'
+  exit 1
+elif [ "$DATE_CHECK" -le "$WARNING_THRESHOLD_DAYS" ]; then
+  echo -n "WARNING: Your environment will expire in less than $WARNING_THRESHOLD_DAYS days. Do you really want to continue? "
+  read CONFIRM
+  CONFIRM=$(echo $CONFIRM | tr a-z A-Z)
+  if [ "$CONFIRM" != "Y" -a "$CONFIRM" != "YES" ]; then
+    echo 'Please update "TF_VAR_endddate" in .env.'"$NAMESPACE"' and try again.'
+    exit 1
+  fi
+fi
 
 mkdir -p $NAMESPACE_DIR
 
-# Check for parcels
+# Perform a quick configuration sanity check before calling Terraform
+source $BASE_DIR/resources/common.sh
+load_stack $NAMESPACE $BASE_DIR/resources local
+log "Validate services selection: $CM_SERVICES"
+CLUSTER_HOST=dummy PRIVATE_IP=dummy PUBLIC_DNS=dummy DOCKER_DEVICE=dummy CDSW_DOMAIN=dummy \
+python $BASE_DIR/resources/cm_template.py --cdh-major-version $CDH_MAJOR_VERSION $CM_SERVICES --validate-only
+
+log "Check for parcels"
 chmod +x $BASE_DIR/resources/check-for-parcels.sh
 $BASE_DIR/resources/check-for-parcels.sh
 
+log "Ensure key pair exists"
 ensure_key_pairs
 
 log "Launching Terraform"

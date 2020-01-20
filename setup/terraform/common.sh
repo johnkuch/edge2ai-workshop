@@ -11,12 +11,40 @@ function check_env_files() {
   fi
 }
 
-function load_env() {
+function check_python_modules() {
+  python -c '
+missing_modules = []
+try:
+  import yaml
+except:
+  print("ERROR: Python module \"PyYAML\" not found.")
+  missing_modules.append("pyyaml")
+
+try:
+  import jinja2
+except:
+  print("ERROR: Python module \"Jinja2\" not found.")
+  missing_modules.append("jinja2")
+
+if missing_modules:
+  print("Please install the missing modules with the command below and try again:")
+  print("\n  pip install " + " ".join(missing_modules) + "\n")
+  exit(1)
+'
+}
+
+function get_env_file_path() {
   local namespace=$1
   local env_file=$BASE_DIR/.env.$namespace
   if [ "$namespace" == "default" ]; then
     env_file=$BASE_DIR/.env
   fi
+  echo $env_file
+}
+
+function load_env() {
+  local namespace=$1
+  local env_file=$(get_env_file_path $namespace)
 
   check_env_files
 
@@ -137,6 +165,59 @@ function check_for_jq() {
     echo "       more details."
     exit 1
   fi
+}
+
+function check_file_staleness() {
+  # check if environment files are missing parameters
+  local basefile=$1
+  local compare=$2
+  local base_variables=$(grep -E "^ *(export){0,1} *[a-zA-Z0-9_]*=" $basefile | sed -E 's/ *(export){0,1} *//;s/=.*//' | sort -u)
+  local stale=0
+  set +e
+  for var in $base_variables; do
+    grep -E "^ *(export){0,1} *$var=" $compare > /dev/null
+    if [ $? != 0 ]; then
+      echo "ERROR: Configuration file $compare is missing property ${var}." > /dev/stderr
+      stale=1
+    fi
+  done
+  not_set=$(grep -E "^ *(export){0,1} *[a-zA-Z0-9_]*=" $compare | sed -E 's/ *(export){0,1} *//;s/="?<[A-Z_]*>"?$/=/g;s/""//g' | egrep "CHANGE_ME|REPLACE_ME|=$" | sed 's/=//' | tr "\n" "," | sed 's/,$//')
+  if [ "$not_set" != "" ]; then
+    echo "ERROR: Configuration file $compare has the following unset properties: ${not_set}." > /dev/stderr
+    stale=1
+  fi
+  set -e
+  echo $stale
+}
+
+function check_config() {
+  local template_file=$1
+  local compare_file=$2
+  if [ ! -f $template_file ]; then
+    echo "ERROR: Cannot find the template file $template_file." > /dev/stderr
+    exit 1
+  fi
+  if [ "$(check_file_staleness $template_file $compare_file)" != "0" ]; then
+      cat > /dev/stderr <<EOF
+
+ERROR: Please fix the problems above in the file $compare_file and try again.
+       If this configuration was working before, you may have upgraded to a new version
+       of the workshop that requires additional properties.
+       You can refer to the template $template_file for a list of all the required properties.
+EOF
+      exit 1
+  fi
+}
+
+function check_all_configs() {
+  local stack
+  check_config $BASE_DIR/.env.template $(get_env_file_path $NAMESPACE)
+  if [ -e $BASE_DIR/resources/stack.${NAMESPACE}.sh ]; then
+    stack=$BASE_DIR/resources/stack.${NAMESPACE}.sh
+  else
+    stack=$BASE_DIR/resources/stack.sh
+  fi
+  check_config $BASE_DIR/resources/stack.template.sh $stack
 }
 
 check_for_jq
