@@ -2,7 +2,7 @@
 set -o errexit
 set -o nounset
 BASE_DIR=$(cd $(dirname $0); pwd -L)
-. $BASE_DIR/common.sh
+source $BASE_DIR/common.sh
 
 function syntax() {
   echo "Syntax: $0 <namespace> [web_ip_adress] [admin_email] [admin_password] [admin_full_name]"
@@ -50,11 +50,12 @@ curl -k -H "Content-Type: application/json" -X POST \
       }' \
   "http://${WEB_IP_ADDRESS}/api/admins" 2>/dev/null
 
-for public_ip in $(awk '{print $3}' $INSTANCE_LIST_FILE); do
+awk '{print $2" "$3}' $INSTANCE_LIST_FILE | while read public_dns public_ip; do
   curl -k -H "Content-Type: application/json" -X POST \
     -u "${ADMIN_EMAIL}:${ADMIN_PWD}" \
     -d '{
          "ip_address":"'"${public_ip}"'",
+         "hostname":"'"${public_dns}"'",
          "ssh_user": "'"$TF_VAR_ssh_username"'",
          "ssh_password": "'"$TF_VAR_ssh_password"'",
          "ssh_private_key": "'"$(cat $TF_VAR_ssh_private_key | tr "\n" "#" | sed 's/#/\\n/g')"'"}' \

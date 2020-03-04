@@ -1,7 +1,56 @@
 #!/bin/bash
 
+DEFAULT_DOCKER_IMAGE=asdaraujo/edge2ai-workshop:latest
+
+# Color codes
+C_NORMAL="$(echo -e "\033[0m")"
+C_BOLD="$(echo -e "\033[1m")"
+C_DIM="$(echo -e "\033[2m")"
+C_RED="$(echo -e "\033[31m")"
+C_YELLOW="$(echo -e "\033[33m")"
+
 function log() {
   echo "[$(date)] [$(basename $0): $BASH_LINENO] : $*"
+}
+
+function _find_docker_image() {
+  local img_candidates=($DEFAULT_DOCKER_IMAGE edge2ai-workshop:latest)
+  if [ "${EDGE2AI_DOCKER_IMAGE:-}" != "" ]; then
+    img_candidates=(${EDGE2AI_DOCKER_IMAGE})
+  fi
+  for img in "${img_candidates[@]}"; do
+    local label=${img%%:*}
+    local tag
+    if [[ $img == *":"* ]]; then
+      tag=${img##*:}
+    else
+      tag=latest
+    fi
+    local has_docker_img=$(docker image ls 2> /dev/null | awk '$1 == "'"$label"'" && $2 == "'"$tag"'"' | wc -l)
+    if [ "$has_docker_img" -eq "1" ]; then
+      echo "${label}:${tag}"
+      return
+    fi
+  done
+}
+
+function check_docker_launch() {
+  local is_inside_docker=$(egrep "/(lxc|docker)/" /proc/1/cgroup > /dev/null 2>&1 && echo yes || echo no)
+  if [ "${NO_DOCKER:-}" == "" -a "$is_inside_docker" == "no" ]; then
+    docker_img=$(_find_docker_image)
+    if [ "$docker_img" != "" ]; then
+      local cmd=./$(basename $0)
+      echo -e "${C_DIM}Using docker image: ${docker_img}${C_NORMAL}"
+      exec docker run -ti --rm --entrypoint="" -v $BASE_DIR:/edge2ai-workshop/setup/terraform $docker_img $cmd $*
+    fi
+  fi
+  if [ "${EDGE2AI_DOCKER_IMAGE:-}" != "" ]; then
+    echo "ERROR: Docker image [$EDGE2AI_DOCKER_IMAGE] does not exist. Please check your EDGE2AI_DOCKER_IMAGE env variable."
+    exit
+  fi
+  if [ "$is_inside_docker" == "no" ]; then
+    echo -e "${C_DIM}Running locally (no docker)${C_NORMAL}"
+  fi
 }
 
 function check_env_files() {
@@ -25,6 +74,12 @@ try:
 except:
   print("ERROR: Python module \"Jinja2\" not found.")
   missing_modules.append("jinja2")
+
+try:
+  import boto3
+except:
+  print("ERROR: Python module \"Boto3\" not found.")
+  missing_modules.append("boto3")
 
 if missing_modules:
   print("Please install the missing modules with the command below and try again:")
@@ -74,18 +129,36 @@ function load_env() {
   export TF_VAR_my_public_ip=$(curl -sL ifconfig.me || curl -sL ipapi.co/ip || curl -sL icanhazip.com)
 }
 
+function get_namespaces() {
+    ls -1d $BASE_DIR/.env* | egrep "/\.env($|\.)" | fgrep -v .env.template | \
+    sed 's/\.env\.//;s/\/\.env$/\/default/' | xargs -I{} basename {}
+}
+
 function show_namespaces() {
   check_env_files
 
-  local namespaces=$(ls -1d $BASE_DIR/.env* | egrep "/\.env($|\.)" | fgrep -v .env.template | \
-                       sed 's/\.env\.//;s/\/\.env$/\/default/')
+  local namespaces=$(get_namespaces)
   if [ "$namespaces" == "" ]; then
     echo -e "\n  No namespaces are currently defined!\n"
   else
     echo -e "\nNamespaces:"
     for namespace in $namespaces; do
-      echo "  - $(basename $namespace)"
+      echo "  - $namespace"
     done
+  fi
+}
+
+function ensure_ulimit() {
+  local ulimit_target=10000
+  local nofile=$(ulimit -n)
+  if [ "$nofile" != "unlimited" -a "$nofile" -lt $ulimit_target ]; then
+    ulimit -n $ulimit_target 2>/dev/null || true
+    nofile=$(ulimit -n)
+    if [ "$nofile" != "unlimited" -a "$nofile" -lt $ulimit_target ]; then
+      echo "WARNING: The maximum number of open file handles for this session is low ($nofile)."
+      echo "         If the launch fails with the message "Too many open files", consider increasing"
+      echo "         it with the ulimit command and try again."
+    fi
   fi
 }
 
@@ -139,7 +212,11 @@ function ensure_instance_list() {
 function public_dns() {
   local cluster_number=$1
   ensure_instance_list $NAMESPACE
-  awk '$1 ~ /-'$cluster_number'$/{print $2}' $INSTANCE_LIST_FILE
+  if [ "$cluster_number" == "web" ]; then
+    awk '{print $2}' $WEB_INSTANCE_LIST_FILE
+  else
+    awk '$1 ~ /-'$cluster_number'$/{print $2}' $INSTANCE_LIST_FILE
+  fi
 }
 
 function public_ip() {
@@ -190,9 +267,14 @@ function check_file_staleness() {
   echo $stale
 }
 
-function check_config() {
-  local template_file=$1
-  local compare_file=$2
+function presign_urls() {
+  local stack_file=$1
+  python $BASE_DIR/presign_urls.py "$stack_file"
+}
+
+function validate_env() {
+  local template_file=$BASE_DIR/.env.template
+  local compare_file=$(get_env_file_path $NAMESPACE)
   if [ ! -f $template_file ]; then
     echo "ERROR: Cannot find the template file $template_file." > /dev/stderr
     exit 1
@@ -209,19 +291,42 @@ EOF
   fi
 }
 
-function check_all_configs() {
-  local stack
-  check_config $BASE_DIR/.env.template $(get_env_file_path $NAMESPACE)
-  if [ -e $BASE_DIR/resources/stack.${NAMESPACE}.sh ]; then
-    stack=$BASE_DIR/resources/stack.${NAMESPACE}.sh
-  else
-    stack=$BASE_DIR/resources/stack.sh
+function kerb_auth_for_cluster() {
+  local cluster_id=$1
+  local public_dns=$(public_dns $cluster_id)
+  if [ "$ENABLE_KERBEROS" == "yes" ]; then
+    export KRB5_CONFIG=$NAMESPACE_DIR/krb5.conf.$cluster_id
+    scp -q -o StrictHostKeyChecking=no -i $TF_VAR_ssh_private_key $TF_VAR_ssh_username@$public_dns:/etc/krb5.conf $KRB5_CONFIG
+    sed -i.bak "s/kdc *=.*internal/kdc = $public_dns/;s/admin_server *=.*internal/admin_server = $public_dns/;/includedir/ d" $KRB5_CONFIG
+    export KRB5CCNAME=/tmp/workshop.$$
+    echo supersecret1 | kinit workshop 2>&1 | grep -v "Password for" | true
   fi
-  check_config $BASE_DIR/resources/stack.template.sh $stack
 }
 
-check_for_jq
+function remaining_days() {
+  local enddate=$1
+  python -c "
+from datetime import datetime, timedelta
+dt = datetime.now()
+dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+print((datetime.strptime('$enddate', '%m%d%Y') - dt).days)
+"
+}
 
-for sig in {0..31}; do
-  trap 'RET=$?; if [ $RET != 0 ]; then echo -e "\n   FAILED!!! (signal: '$sig', exit code: $RET)\n"; fi' $sig
-done
+function set_traps() {
+  for sig in {0..16} {18..31}; do
+    trap 'RET=$?; reset_traps; if [ $RET != 0 ]; then echo -e "\n   FAILED!!! (signal: '$sig', exit code: $RET)\n"; fi; set +e; kdestroy > /dev/null 2>&1' $sig
+  done
+}
+
+function reset_traps() {
+  for sig in {0..16} {18..31}; do
+    trap - $sig
+  done
+}
+
+ARGS=("$@")
+ensure_ulimit
+check_docker_launch "${ARGS[@]:-}"
+check_for_jq
+set_traps

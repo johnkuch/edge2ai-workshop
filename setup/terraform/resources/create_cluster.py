@@ -1,10 +1,15 @@
-from __future__ import print_function
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""Cluster creation controls for Cloudera Manager submission"""
+
 from cm_client.rest import ApiException
 from collections import namedtuple
 from datetime import datetime
 from optparse import OptionParser
 import cm_client
 import json
+import os
 import sys
 import time
 import urllib3
@@ -47,6 +52,9 @@ def _get_parser():
 def parse_args():
     return _get_parser().parse_args()
 
+def cm_major_version():
+    return int(os.environ.get('CM_MAJOR_VERSION', '7'))
+
 class ClusterCreator:
     def __init__(self, host, template, key_file, cm_repo_url, use_kerberos,
                  krb_princ='scm/admin@WORKSHOP.COM', krb_pass='supersecret1'):
@@ -66,6 +74,34 @@ class ClusterCreator:
 
         cm_client.configuration.username = 'admin'
         cm_client.configuration.password = 'admin'
+
+    def _import_paywall_credentials(self):
+        if cm_major_version() >= 7:
+            configs = []
+            if 'REMOTE_REPO_USR' in os.environ and os.environ['REMOTE_REPO_USR']:
+                paywall_usr = os.environ['REMOTE_REPO_USR']
+                configs.append(cm_client.ApiConfig(name='REMOTE_REPO_OVERRIDE_USER', value=paywall_usr))
+            if 'REMOTE_REPO_PWD' in os.environ and os.environ['REMOTE_REPO_PWD']:
+                paywall_pwd = os.environ['REMOTE_REPO_PWD']
+                configs.append(cm_client.ApiConfig(name='REMOTE_REPO_OVERRIDE_PASSWORD', value=paywall_pwd))
+            try:
+                if configs:
+                    self.cm_api.update_config(message='Importing paywall credentials',
+                                              body=cm_client.ApiConfigList(configs))
+            except ApiException:
+                pass
+
+    def _reset_paywall_credentials(self):
+        if cm_major_version() >= 7:
+            try:
+                self.cm_api.update_config(message='Importing paywall credentials',
+                                          body=cm_client.ApiConfigList([
+                                                   cm_client.ApiConfig(name='REMOTE_REPO_OVERRIDE_USER', value=None),
+                                                   cm_client.ApiConfig(name='REMOTE_REPO_OVERRIDE_PASSWORD', value=None)
+                                               ])
+                                         )
+            except ApiException:
+                pass
 
     @property
     def api_client(self):
@@ -111,7 +147,7 @@ class ClusterCreator:
         try:
             cmd_api_instance = cm_client.CommandsResourceApi(self.api_client)
             while True:
-                cmd = cmd_api_instance.read_command(long(cmd.id))
+                cmd = cmd_api_instance.read_command(int(cmd.id))
                 print(datetime.strftime(datetime.now(), '%c'))
                 print_cmd(cmd)
                 if not cmd.active:
@@ -129,6 +165,7 @@ class ClusterCreator:
             print("Exception when calling ClouderaManagerResourceApi->import_cluster_template: %s\n" % e)
 
     def create_cluster(self):
+
         # accept trial licence
         try:
             self.cm_api.begin_trial()
@@ -142,6 +179,7 @@ class ClusterCreator:
         with open (self.key_file, "r") as f:
             key = f.read()
         
+        self._import_paywall_credentials()
         instargs = cm_client.ApiHostInstallArguments(host_names=[self.host], 
                                                      user_name='root', 
                                                      private_key=key, 
@@ -188,6 +226,9 @@ class ClusterCreator:
         cmd = self.wait(cmd)
         if not cmd.success:
             raise RuntimeError('Failed to deploy cluster template')
+
+        # All parcel downloads should've already been done at this point, so we can safely remove the paywall credentials
+        self._reset_paywall_credentials()
 
         if self.use_kerberos:
             self._enable_kerberos()

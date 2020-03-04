@@ -21,6 +21,7 @@
     {
       "refName": "streams_messaging_manager",
       "serviceType": "STREAMS_MESSAGING_MANAGER",
+      "displayName": "SMM",
       "roleConfigGroups": [
         {
           "refName": "streams_messaging_manager-STREAMS_MESSAGING_MANAGER_SERVER-BASE",
@@ -43,6 +44,16 @@
               "name" : "inactive.producer.timeout.ms",
               "value" : "180000"
             },
+{% if HAS_SRM %}
+            {
+              "name" : "streams.replication.manager.configure",
+              "value" : "true"
+            },
+            {
+              "name" : "streams.replication.manager.host",
+              "value" : "{{CLUSTER_HOST}}"
+            },
+{% endif %}
 {% if CDH_MAJOR_VERSION == '6' %}
             {
               "name" : "streams.messaging.manager.schema.registry.url",

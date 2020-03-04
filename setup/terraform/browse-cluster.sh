@@ -3,7 +3,8 @@
 set -o errexit
 set -o nounset
 BASE_DIR=$(cd $(dirname $0); pwd -L)
-. $BASE_DIR/common.sh
+export NO_DOCKER=1
+source $BASE_DIR/common.sh
 
 if [ $# != 2 -a $# != 3 ]; then
   echo "Syntax: $0 <namespace> <cluster_number>"
@@ -14,6 +15,9 @@ NAMESPACE=$1
 CLUSTER_ID=$2
 PROXY_PORT=${3:-}
 load_env $NAMESPACE
+
+source $BASE_DIR/resources/common.sh
+load_stack $NAMESPACE $BASE_DIR/resources local
 
 PUBLIC_DNS=$(public_dns $CLUSTER_ID)
 if [ "$PUBLIC_DNS" == "" ]; then
@@ -26,13 +30,18 @@ if [ "$PROXY_PORT" != "" ]; then
   PROXY_PORT="--proxy-server=socks5://localhost:$PROXY_PORT"
 fi
 
-rm -rf $HOME/chrome-for-demo
-mkdir $HOME/chrome-for-demo
-touch "$HOME/chrome-for-demo/First Run"
+kerb_auth_for_cluster $CLUSTER_ID
+
+BROWSER_DIR=$HOME/.chrome-for-demo.${NAMESPACE}.${CLUSTER_ID}
+rm -rf ${BROWSER_DIR}
+mkdir ${BROWSER_DIR}
+touch "${BROWSER_DIR}/First Run"
 
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-  --user-data-dir="$HOME/chrome-for-demo" \
+  --user-data-dir="${BROWSER_DIR}" \
   --window-size=1184,854 \
+  --auth-server-whitelist="$PUBLIC_DNS" \
+  --auth-negotiate-delegatewhitelist="$PUBLIC_DNS" \
   $PROXY_PORT \
   http://$PUBLIC_DNS:7180 \
   http://$PUBLIC_DNS:10080/efm/ui \

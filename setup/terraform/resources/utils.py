@@ -1,17 +1,22 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-#__all__ = ['get_public_ip']
+"""
+Common utilities for Python scripts
+"""
 
-import json
 import logging
 import re
 import requests
-import sys
 import time
+import os
+import sys
+from inspect import getmembers
 from contextlib import contextmanager
-from subprocess import Popen, PIPE
+from impala.dbapi import connect
 from nipyapi import config, canvas, versioning, nifi
 from nipyapi.nifi.rest import ApiException
+
 
 LOG = logging.getLogger(__name__)
 LOG.setLevel(logging.INFO)
@@ -27,10 +32,20 @@ _NIFIREG_API_URL = 'http://edge2ai-1.dim.local:18080/nifi-registry-api'
 _SCHREG_API_URL = 'http://edge2ai-1.dim.local:7788/api/v1'
 _SMM_API_URL = 'http://edge2ai-1.dim.local:8585'
 
+_SCHEMA_URI = 'https://raw.githubusercontent.com/asdaraujo/edge2ai-workshop/master/sensor.avsc'
+
+_CDSW_MODEL_NAME = 'IoT Prediction Model'
+_CDSW_USERNAME = 'admin'
+_CDSW_PASSWORD = 'supersecret1'
+_CDSW_FULL_NAME = 'Workshop Admin'
+_CDSW_EMAIL = 'admin@cloudera.com'
+
+PG_NAME = 'Process Sensor Data'
+
 _AGENT_MANIFESTS = None
 
 _CREATE_KUDU_TABLE = """
-CREATE TABLE sensors
+CREATE TABLE IF NOT EXISTS sensors
 (
  sensor_id INT,
  sensor_ts TIMESTAMP,
@@ -54,13 +69,10 @@ STORED AS KUDU
 TBLPROPERTIES ('kudu.num_tablet_replicas' = '1');
 """
 
-_DROP_KUDU_TABLE = "DROP TABLE sensors;"
-
-_CDSW_MODEL_NAME = 'IoT Prediction Model'
-_CDSW_USERNAME = 'admin'
-_CDSW_PASSWORD = 'supersecret1'
+_DROP_KUDU_TABLE = "DROP TABLE IF EXISTS sensors;"
 
 # General helper functions
+
 
 def get_public_ip():
     retries = 3
@@ -72,11 +84,13 @@ def get_public_ip():
         time.sleep(1)
     raise RuntimeError('Failed to get the public IP address.')
 
+
 def api_request(method, url, expected_code=requests.codes.ok, **kwargs):
     resp = requests.request(method, url, **kwargs)
     if resp.status_code != expected_code:
         raise RuntimeError('Request to URL %s returned code %s (expected was %s), Response: %s' % (resp.url, resp.status_code, expected_code, resp.text))
     return resp
+
 
 @contextmanager
 def exception_context(obj):
@@ -85,6 +99,7 @@ def exception_context(obj):
     except:
         print('Exception context: %s' % (obj,))
         raise
+
 
 def retry_test(max_retries=0, wait_time_secs=0):
     def wrap(f):
@@ -106,11 +121,14 @@ def retry_test(max_retries=0, wait_time_secs=0):
 
 # CDSW helper functions
 
+
 def get_cdsw_api():
     return 'http://cdsw.%s.nip.io/api/v1' % (get_public_ip(),)
 
+
 def get_cdsw_altus_api():
     return 'http://cdsw.%s.nip.io/api/altus-ds-1' % (get_public_ip(),)
+
 
 def get_cdsw_model_access_key():
     def _open_cdsw_session():
@@ -140,21 +158,31 @@ def get_cdsw_model_access_key():
 
 # Kudu helper functions
 
+
 def create_kudu_table():
-    p = Popen("impala-shell", shell=True, stdin=PIPE, stdout=PIPE, stderr=PIPE)
-    stdout, stderr = p.communicate(_CREATE_KUDU_TABLE)
-    if not 'Table has been created.' in stdout:
-        raise RuntimeError('Failed to create Kudu table.')
+    conn = connect(host='localhost', port=21050)
+    cursor = conn.cursor()
+    cursor.execute(_CREATE_KUDU_TABLE)
+    result = cursor.fetchall()
+    if not any(x in str(result) for x in ["Table has been created", "Table already exists"]):
+        raise RuntimeError('Failed to create Kudu table, response was:', str(result))
+
 
 def drop_kudu_table():
-    p = Popen("impala-shell", shell=True, stdin=PIPE, stdout=PIPE, stderr=PIPE)
-    stdout, stderr = p.communicate(_DROP_KUDU_TABLE)
+    conn = connect(host='localhost', port=21050)
+    cursor = conn.cursor()
+    cursor.execute(_DROP_KUDU_TABLE)
+    result = cursor.fetchall()
+    if not any(x in str(result) for x in ["Table has been dropped", "Table does not exist"]):
+        raise RuntimeError('Failed to drop Kudu table, response was:', str(result))
 
 # NiFi helper functions
+
 
 def create_processor(pg, name, processor_type, position, config):
     proc_type = canvas.get_processor_type(processor_type, identifier_type='name')
     return canvas.create_processor(pg, proc_type, position, name, config)
+
 
 def create_funnel(pg_id, position):
     funnel = canvas.create_funnel(pg_id, position=position)
@@ -171,6 +199,7 @@ def create_funnel(pg_id, position):
     })
     return funnel
 
+
 def update_connection(source, destination, new_destination):
     conn = [c for c in canvas.list_all_connections() if c.source_id == source.id and c.destination_id == destination.id][0]
     return nifi.ConnectionsApi().update_connection(conn.id, {
@@ -185,11 +214,13 @@ def update_connection(source, destination, new_destination):
         }
     })
 
+
 def get_controller_type(controller_type):
     types = [ctype for ctype in canvas.list_all_controller_types() if ctype.type == controller_type]
     if types:
         return types[0]
     return None
+
 
 def create_controller(pg, controller_type, properties, start, name=None):
     controller_type = get_controller_type(controller_type)
@@ -199,6 +230,7 @@ def create_controller(pg, controller_type, properties, start, name=None):
     controller = canvas.get_controller(controller.id, 'id')
     canvas.schedule_controller(controller, start)
     return canvas.get_controller(controller.id, 'id')
+
 
 def nifi_delete_all(pg):
     canvas.schedule_process_group(pg.id, False)
@@ -226,22 +258,28 @@ def nifi_delete_all(pg):
 
 # EFM helper functions
 
+
 def efm_api_request(method, endpoint, expected_code=requests.codes.ok, **kwargs):
     url = _EFM_API_URL + endpoint
     return api_request(method, url, expected_code, **kwargs)
-    
+
+
 def efm_api_get(endpoint, expected_code=requests.codes.ok, **kwargs):
     return efm_api_request('GET', endpoint, expected_code, **kwargs)
+
 
 def efm_api_post(endpoint, expected_code=requests.codes.ok, **kwargs):
     return efm_api_request('POST', endpoint, expected_code, **kwargs)
 
+
 def efm_api_delete(endpoint, expected_code=requests.codes.ok, **kwargs):
     return efm_api_request('DELETE', endpoint, expected_code, **kwargs)
+
 
 def efm_get_client_id():
     resp = efm_api_get('/designer/client-id')
     return resp.text
+
 
 def efm_get_agent_manifests():
     global _AGENT_MANIFESTS
@@ -250,6 +288,7 @@ def efm_get_agent_manifests():
         _AGENT_MANIFESTS = resp.json()
     return _AGENT_MANIFESTS
 
+
 def efm_get_flow(agent_class):
     resp = efm_api_get('/designer/flows')
     json = resp.json()
@@ -257,6 +296,7 @@ def efm_get_flow(agent_class):
     assert(len(json['elements']) == 1)
     flow = json['elements'][0]
     return (flow['identifier'], flow['rootProcessGroupIdentifier'])
+
 
 def efm_get_processor_bundle(processor_type):
     for manifest in efm_get_agent_manifests():
@@ -269,6 +309,7 @@ def efm_get_processor_bundle(processor_type):
                                'version': processor['version'],
                            }
     raise RuntimeError('Processor type %s not found in agent manifest.' % (processor_type,))
+
 
 def efm_create_processor(flow_id, pg_id, name, processor_type, position, properties, auto_terminate=None):
     endpoint = '/designer/flows/{flowId}/process-groups/{pgId}/processors'.format(flowId=flow_id, pgId=pg_id)
@@ -292,6 +333,7 @@ def efm_create_processor(flow_id, pg_id, name, processor_type, position, propert
     resp = efm_api_post(endpoint, requests.codes.created, headers={'Content-Type': 'application/json'}, json=body)
     return resp.json()['componentConfiguration']['identifier']
 
+
 def efm_create_remote_processor_group(flow_id, pg_id, name, rpg_url, transport_protocol, position):
     endpoint = '/designer/flows/{flowId}/process-groups/{pgId}/remote-process-groups'.format(flowId=flow_id, pgId=pg_id)
     body = {
@@ -313,6 +355,7 @@ def efm_create_remote_processor_group(flow_id, pg_id, name, rpg_url, transport_p
     resp = efm_api_post(endpoint, requests.codes.created, headers={'Content-Type': 'application/json'}, json=body)
     return resp.json()['componentConfiguration']['identifier']
 
+
 def efm_get_all_by_type(flow_id, obj_type):
     endpoint = '/designer/flows/{flowId}'.format(flowId=flow_id)
     resp = efm_api_get(endpoint, headers={'Content-Type': 'application/json'})
@@ -321,6 +364,7 @@ def efm_get_all_by_type(flow_id, obj_type):
         endpoint = '/designer/flows/{flowId}/{objType}/{objId}'.format(flowId=flow_id, objType=obj_type_alt, objId=obj['identifier'])
         resp = efm_api_get(endpoint, headers={'Content-Type': 'application/json'})
         yield resp.json()
+
 
 def efm_delete_by_type(flow_id, obj, obj_type):
     obj_id = obj['componentConfiguration']['identifier']
@@ -331,10 +375,12 @@ def efm_delete_by_type(flow_id, obj, obj_type):
     resp = efm_api_delete(endpoint, headers={'Content-Type': 'application/json'})
     LOG.debug('Object of type %s (%s) deleted.', obj_type, obj_id)
 
+
 def efm_delete_all(flow_id):
     for obj_type in ['connections', 'remoteProcessGroups', 'processors', 'inputPorts', 'outputPorts']:
         for conn in efm_get_all_by_type(flow_id, obj_type):
             efm_delete_by_type(flow_id, conn, obj_type)
+
 
 def efm_create_connection(flow_id, pg_id, source_id, source_type, destination_id, destination_type, relationships, source_port=None, destination_port=None):
     def _get_endpoint(endpoint_id, endpoint_type, endpoint_port):
@@ -360,6 +406,7 @@ def efm_create_connection(flow_id, pg_id, source_id, source_type, destination_id
     resp = efm_api_post(endpoint, requests.codes.created, headers={'Content-Type': 'application/json'}, json=body)
     return resp.json()
 
+
 def efm_publish_flow(flow_id, comments):
     endpoint = '/designer/flows/{flowId}/publish'.format(flowId=flow_id)
     body = {
@@ -368,6 +415,7 @@ def efm_publish_flow(flow_id, comments):
     resp = efm_api_post(endpoint, headers={'Content-Type': 'application/json'}, json=body)
 
 # NiFi Registry helper functions
+
 
 def save_flow_ver(process_group, registry_client, bucket, flow_name=None,
                   flow_id=None, comment='', desc='', refresh=True, force=False):
@@ -411,12 +459,15 @@ def save_flow_ver(process_group, registry_client, bucket, flow_name=None,
             body=body
         )
 
+
 def nifireg_api_request(method, endpoint, expected_code=requests.codes.ok, **kwargs):
     url = _NIFIREG_API_URL + endpoint
     return api_request(method, url, expected_code, **kwargs)
-    
+
+
 def nifireg_api_delete(endpoint, expected_code=requests.codes.ok, **kwargs):
     return nifireg_api_request('DELETE', endpoint, expected_code, **kwargs)
+
 
 def nifireg_delete_flows(identifier, identifier_type='name'):
     bucket = versioning.get_registry_bucket(identifier, identifier_type)
@@ -427,39 +478,50 @@ def nifireg_delete_flows(identifier, identifier_type='name'):
 
 # Schema Registry helper functions
 
+
 def schreg_api_request(method, endpoint, expected_code=requests.codes.ok, **kwargs):
     url = _SCHREG_API_URL + endpoint
     return api_request(method, url, expected_code, **kwargs)
-    
+
+
 def schreg_api_get(endpoint, expected_code=requests.codes.ok, **kwargs):
     return schreg_api_request('GET', endpoint, expected_code, **kwargs)
+
 
 def schreg_api_post(endpoint, expected_code=requests.codes.ok, **kwargs):
     return schreg_api_request('POST', endpoint, expected_code, **kwargs)
 
+
 def schreg_api_delete(endpoint, expected_code=requests.codes.ok, **kwargs):
     return schreg_api_request('DELETE', endpoint, expected_code, **kwargs)
+
 
 def schreg_get_versions(name):
     endpoint = '/schemaregistry/schemas/{name}/versions'.format(name=name)
     resp = schreg_api_get(endpoint, headers={'Content-Type': 'application/json'})
     return resp.json()['entities']
 
+
 def schreg_get_all_schemas():
     endpoint = '/schemaregistry/schemas'
     resp = schreg_api_get(endpoint, headers={'Content-Type': 'application/json'})
     return resp.json()['entities']
 
+
 def schreg_delete_all_schemas():
     for schema in schreg_get_all_schemas():
         schreg_delete_schema(schema['schemaMetadata']['name'])
+
 
 def schreg_delete_schema(name):
     endpoint = '/schemaregistry/schemas/{name}'.format(name=name)
     resp = schreg_api_delete(endpoint, headers={'Content-Type': 'application/json'})
     LOG.debug('Schema %s deleted.', name)
 
+
 def schreg_create_schema(name, description, schema_text):
+    assert schema_text is not None
+    assert len(schema_text) > 0
     endpoint = '/schemaregistry/schemas'
     body = {
         'type': 'avro',
@@ -473,6 +535,7 @@ def schreg_create_schema(name, description, schema_text):
     resp = schreg_api_post(endpoint, requests.codes.created, headers={'Content-Type': 'application/json'}, json=body)
     schreg_create_schema_version(name, schema_text)
 
+
 def schreg_create_schema_version(name, schema_text):
     endpoint = '/schemaregistry/schemas/{name}/versions'.format(name=name)
     body = {
@@ -480,16 +543,29 @@ def schreg_create_schema_version(name, schema_text):
     }
     resp = schreg_api_post(endpoint, requests.codes.created, headers={'Content-Type': 'application/json'}, json=body)
 
+
+def read_in_schema(uri=_SCHEMA_URI):
+    if 'SCHEMA_FILE' in os.environ and os.path.exists(os.environ['SCHEMA_FILE']):
+        return open(os.environ['SCHEMA_FILE']).read()
+    else:
+        r = requests.get(_SCHEMA_URI)
+        if r.status_code == 200:
+            return r.text
+        raise ValueError("Unable to retrieve schema from URI, response was %s", r.response_code)
+
 # SMM helper functions
+
 
 def smm_api_request(method, endpoint, expected_code=requests.codes.ok, **kwargs):
     url = _SMM_API_URL + endpoint
     return api_request(method, url, expected_code, **kwargs)
-    
+
+
 def smm_api_get(endpoint, expected_code=requests.codes.ok, **kwargs):
     return smm_api_request('GET', endpoint, expected_code, **kwargs)
 
 # MAIN
+
 
 def set_environment(run_id):
     if not run_id:
@@ -507,7 +583,8 @@ def set_environment(run_id):
 
     return (run_id, root_pg, efm_pg_id, flow_id)
 
-def global_teardown(run_id):
+
+def global_teardown(run_id=None):
     (run_id, root_pg, efm_pg_id, flow_id) = set_environment(run_id)
 
     canvas.schedule_process_group(root_pg.id, False)
@@ -530,29 +607,48 @@ def global_teardown(run_id):
     reg_client = versioning.get_registry_client('NiFi Registry')
     if reg_client:
         versioning.delete_registry_client(reg_client)
-    #nifireg_delete_flows('IoT')
     nifireg_delete_flows('SensorFlows')
     drop_kudu_table()
 
-def global_setup(run_id, schema_text):
+
+def global_setup(run_id=None, schema_text=None, cdsw_flag=True, target_lab=99):
     class _Env(object): pass
     env = _Env()
     env.run_id, env.root_pg, env.efm_pg_id, env.flow_id = set_environment(run_id)
-    env.schema_text = schema_text
+    env.schema_text = schema_text if schema_text is not None else read_in_schema()
+    LOG.info("Using Schema: %s", schema_text)
+    env.cdsw_flag = cdsw_flag
 
-    step1_sensor_simulator(env)
-    step2_edge_flow(env)
-    step3_register_schema(env)
-    step4_nifi_flow(env)
-    step6_expand_edge_flow(env)
-    step7_rest_and_kudu(env)
+    lab_setup_functions = [o for o, p in getmembers(sys.modules[__name__]) if 'lab' in o]
+    LOG.info("Found Lab Setup Functions: %s", str(lab_setup_functions))
+    for lab_setup_func in lab_setup_functions:
+        if int(lab_setup_func[3]) < target_lab:
+            LOG.info("[{0}] is numbered lower than target [lab{1}], executing".format(lab_setup_func, target_lab))
+            globals()[lab_setup_func](env)
+        else:
+            LOG.info("[{0}] is numbered higher than target [lab{1}], skipping".format(lab_setup_func, target_lab))
 
-def step1_sensor_simulator(env):
+def wait_for_data(timeout_secs=120):
+    LOG.info("Setup complete, waiting for data to flow in NiFi")
+    while timeout_secs:
+        bytes_in = canvas.get_process_group(PG_NAME, 'name').status.aggregate_snapshot.bytes_in
+        if bytes_in > 0:
+            break
+        timeout_secs -= 1
+        LOG.info("Data not Flowing yet, sleeping for 3")
+        time.sleep(3)
+
+    # wait a few more seconds just to let the pipes to be primed
+    time.sleep(10)
+
+
+def lab1_sensor_simulator(env):
+    LOG.info("Running step1_sensor_simulator")
     # Create a processor to run the sensor simulator
     gen_data = create_processor(env.root_pg, 'Generate Test Data', 'org.apache.nifi.processors.standard.ExecuteProcess', (0, 0),
         {
             'properties': {
-                'Command': 'python',
+                'Command': 'python3',
                 'Command Arguments': '/opt/demo/simulate.py',
             },
             'schedulingPeriod': '1 sec',
@@ -562,7 +658,9 @@ def step1_sensor_simulator(env):
     )
     canvas.schedule_processor(gen_data, True)
 
-def step2_edge_flow(env):
+
+def lab2_edge_flow(env):
+    LOG.info("Running step2_edge_flow")
     # Create input port and funnel in NiFi
     env.from_gw = canvas.create_port(env.root_pg.id, 'INPUT_PORT', 'from Gateway', 'STOPPED', (0, 200))
     funnel_position = (96, 350)
@@ -589,13 +687,17 @@ def step2_edge_flow(env):
         versioning.create_registry_bucket('IoT')
 
     # Publish/version the flow
-    efm_publish_flow(env.flow_id, 'First version - ' + env.run_id)
+    efm_publish_flow(env.flow_id, 'First version - ' + str(env.run_id))
 
-def step3_register_schema(env):
+
+def lab3_register_schema(env):
+    LOG.info("Running step3_register_schema")
     # Create Schema
     schreg_create_schema('SensorReading', 'Schema for the data generated by the IoT sensors', env.schema_text)
 
-def step4_nifi_flow(env):
+
+def lab4_nifi_flow(env):
+    LOG.info("Running step4_nifi_flow")
     # Create a bucket in NiFi Registry to save the edge flow versions
     env.sensor_bucket = versioning.get_registry_bucket('SensorFlows')
     if not env.sensor_bucket:
@@ -603,14 +705,14 @@ def step4_nifi_flow(env):
 
     # Create NiFi Process Group
     env.reg_client = versioning.create_registry_client('NiFi Registry', _NIFIREG_URL, 'The registry...')
-    env.sensor_pg = canvas.create_process_group(env.root_pg, 'Process Sensor Data', (330, 350))
+    env.sensor_pg = canvas.create_process_group(env.root_pg, PG_NAME, (330, 350))
     #env.sensor_flow = versioning.save_flow_ver(env.sensor_pg, env.reg_client, env.sensor_bucket, flow_name='SensorProcessGroup', comment='Enabled version control - ' + env.run_id)
-    env.sensor_flow = save_flow_ver(env.sensor_pg, env.reg_client, env.sensor_bucket, flow_name='SensorProcessGroup', comment='Enabled version control - ' + env.run_id)
+    env.sensor_flow = save_flow_ver(env.sensor_pg, env.reg_client, env.sensor_bucket, flow_name='SensorProcessGroup', comment='Enabled version control - ' + str(env.run_id))
 
     # Create controller services
     env.sr_svc = create_controller(env.sensor_pg, 'org.apache.nifi.schemaregistry.hortonworks.HortonworksSchemaRegistry', {'url': _SCHREG_API_URL}, True)
     env.json_reader_svc = create_controller(env.sensor_pg, 'org.apache.nifi.json.JsonTreeReader', {'schema-access-strategy': 'schema-name', 'schema-registry': env.sr_svc.id}, True)
-    env.json_writer_svc = create_controller(env.sensor_pg, 'org.apache.nifi.json.JsonRecordSetWriter', {'schema-access-strategy': 'inherit-record-schema', 'schema-registry': env.sr_svc.id, 'Schema Write Strategy': 'hwx-schema-ref-attributes'}, True)
+    env.json_writer_svc = create_controller(env.sensor_pg, 'org.apache.nifi.json.JsonRecordSetWriter', {'schema-access-strategy': 'schema-name', 'schema-registry': env.sr_svc.id, 'Schema Write Strategy': 'hwx-schema-ref-attributes'}, True)
 
     # Create flow
     sensor_port = canvas.create_port(env.sensor_pg.id, 'INPUT_PORT', 'Sensor Data', 'RUNNING', (0, 0))
@@ -645,7 +747,7 @@ def step4_nifi_flow(env):
 
     # Commit changes
     #versioning.save_flow_ver(env.sensor_pg, env.reg_client, env.sensor_bucket, flow_id=env.sensor_flow.version_control_information.flow_id, comment='First version - ' + env.run_id)
-    save_flow_ver(env.sensor_pg, env.reg_client, env.sensor_bucket, flow_id=env.sensor_flow.version_control_information.flow_id, comment='First version - ' + env.run_id)
+    save_flow_ver(env.sensor_pg, env.reg_client, env.sensor_bucket, flow_id=env.sensor_flow.version_control_information.flow_id, comment='First version - ' + str(env.run_id))
 
     # Start flow
     canvas.schedule_process_group(env.root_pg.id, True)
@@ -653,7 +755,9 @@ def step4_nifi_flow(env):
     # Update "from Gateway" input port to connect to the process group
     update_connection(env.from_gw, env.temp_funnel, sensor_port)
 
-def step6_expand_edge_flow(env):
+
+def lab6_expand_edge_flow(env):
+    LOG.info("Running step6_expand_edge_flow")
     # Expand the CEM flow
     extract_proc = efm_create_processor(
         env.flow_id, env.efm_pg_id,
@@ -682,9 +786,11 @@ def step6_expand_edge_flow(env):
     filter_conn = efm_create_connection(env.flow_id, env.efm_pg_id, filter_proc, 'PROCESSOR', env.nifi_rpg, 'REMOTE_INPUT_PORT', ['unmatched'], destination_port=env.from_gw.id)
 
     # Publish/version flow
-    efm_publish_flow(env.flow_id, 'Second version - ' + env.run_id)
+    efm_publish_flow(env.flow_id, 'Second version - ' + str(env.run_id))
 
-def step7_rest_and_kudu(env):
+
+def lab7_rest_and_kudu(env):
+    LOG.info("Running step7_rest_and_kudu")
     # Create controllers
     json_reader_with_schema_svc = create_controller(env.sensor_pg,
                                                     'org.apache.nifi.json.JsonTreeReader',
@@ -772,14 +878,14 @@ def step7_rest_and_kudu(env):
     canvas.create_connection(write_kudu, monitor_activity, ['success'])
 
     # Version flow
-    #versioning.save_flow_ver(env.sensor_pg, env.reg_client, env.sensor_bucket, flow_id=env.sensor_flow.version_control_information.flow_id, comment='Second version - ' + env.run_id)
-    save_flow_ver(env.sensor_pg, env.reg_client, env.sensor_bucket, flow_id=env.sensor_flow.version_control_information.flow_id, comment='Second version - ' + env.run_id)
+    save_flow_ver(env.sensor_pg, env.reg_client, env.sensor_bucket, flow_id=env.sensor_flow.version_control_information.flow_id, comment='Second version - ' + str(env.run_id))
 
     # Prepare Impala/Kudu table
     create_kudu_table()
 
     # Set the variable with the CDSW access key
-    canvas.update_variable_registry(env.sensor_pg, [('cdsw.access.key', get_cdsw_model_access_key())])
+    if env.cdsw_flag:
+        canvas.update_variable_registry(env.sensor_pg, [('cdsw.access.key', get_cdsw_model_access_key())])
 
     # Start everything
     canvas.schedule_process_group(env.root_pg.id, True)

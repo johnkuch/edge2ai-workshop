@@ -2,7 +2,7 @@
 set -o errexit
 set -o nounset
 BASE_DIR=$(cd $(dirname $0); pwd -L)
-. $BASE_DIR/common.sh
+source $BASE_DIR/common.sh
 
 if [ $# -lt 2 ]; then
   echo "Syntax: $0 <namespace> command"
@@ -21,10 +21,8 @@ cmd=("$@")
 for line in $(awk '{print $1":"$3}' $INSTANCE_LIST_FILE); do
   cluster_name="$(echo "$line" | awk -F: '{print $1}'): "
   public_ip=$(echo "$line" | awk -F: '{print $2}')
-  bold="$(echo -e "\033[0m\033[1m")"
-  normal="$(echo -e "\033[0m")"
   ssh -q -o StrictHostKeyChecking=no -i $TF_VAR_ssh_private_key $TF_VAR_ssh_username@$public_ip "${cmd[@]}" 2>&1 | \
-    sed "s/^/${cluster_name}/" | tee $LOG_FILE | sed "s/^[^:]*:/${bold}&${normal}/" &
+    sed "s/^/${cluster_name}/" | tee $LOG_FILE | sed "s/^[^:]*:/${C_NORMAL}${C_BOLD}&${C_NORMAL}/" &
 done
 
 wait
